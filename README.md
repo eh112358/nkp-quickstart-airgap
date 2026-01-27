@@ -31,7 +31,7 @@ Steps to install all the required CLIs (nkp, kubectl and helm) to create and man
 1. [Prerequisites Checklist](#prerequisites-checklist)
 1. [Deploy Linux jump host](#deploy-linux-jump-host)
 1. [Install NKP CLI](#install-nkp-cli)
-1. [(Optional) Create NKP Cluster on Nutanix](#optional-create-nkp-cluster-on-nutanix)
+1. [Airgap Deployment Guide](#airgap-deployment-guide)
 1. [Creating Workload Clusters](#creating-workload-clusters)
 1. [Security Considerations](#security-considerations)
 1. [Troubleshooting](#troubleshooting)
@@ -196,37 +196,248 @@ In an airgap deployment, you cannot pull container images directly from public r
 
     When prompted, you must use the download link as-is, which is available in the Nutanix portal.
 
-## (Optional) Create NKP cluster on Nutanix
+## Airgap Deployment Guide
 
-1. Before you start, ensure you meet the prerequisites:
+This section provides detailed step-by-step instructions for deploying NKP in an airgapped environment.
 
-    - Static IP address for the control plane VIP
-    - One or more IP addresses for the NKP dashboard and load-balancing service
+### Step 1: Download the Airgap Bundle (Internet-Connected Machine)
 
-    Note: The IP addresses must be in the same subnet as the virtual machines.
-
-1. Choose one of the following two installation methods:
-
-    - **Prompt-based installation**. Use this method when the Internet connection for the NKP cluster isn’t shared with more users.
-    - **CLI installation**. Use this method when the Internet connection for the NKP cluster is shared between many users.
-
-### Prompt-based installation
-
-This installation method gives less control on the cluster configuration. For example, the NKP cluster will be created with three control plane nodes and four worker nodes.
-
-We recommend starting a tmux session in case your ssh connection is at risk of disconnection (like laptop going into sleep mode) as the process can take some time based on several paramters (like download speed).
+Run the bundle download script:
 
 ```shell
-nkp create cluster nutanix
+./get-nkp-airgap-bundle.sh
 ```
 
-### CLI installation
+**What this does**:
+- Prompts for the Nutanix portal download link
+- Downloads the airgap bundle (~50 GB)
+- Extracts to `./nkp-{version}/` directory
+- Creates `bundle-path` file storing the bundle location
 
-This installation method lets you fully customize your cluster configuration. The following commands create a cluster with one control plane node and three worker nodes.
+**Expected output**:
+```
+Enter the download link: [paste link from portal]
+Downloading...
+Extracting...
+Bundle extracted to: /home/nutanix/nkp-2.x.x
+```
 
-1. Before running the following command in your jump host VM, update the values with your environment: [nkp-env](./nkp-env)
+**Verification**:
+```shell
+cat bundle-path
+ls -la $(cat bundle-path)
+```
 
-1. The next command will start the installation process of an NKP management cluster: [nkp-create-cluster](./nkp-create-mgmt-cluster.sh)
+### Step 2: Transfer to Airgapped Environment
+
+Transfer these items to your airgapped jump host:
+- The entire `nkp-{version}/` directory
+- The `bundle-path` file
+- The repository scripts
+
+**Transfer methods**:
+- USB drive
+- Secure file transfer
+- DVD/Blu-ray media
+
+### Step 3: Configure Environment Variables
+
+Edit the `nkp-env` file with your environment-specific values:
+
+```shell
+vi nkp-env
+```
+
+#### Required Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `CLUSTER_NAME` | Name for your NKP cluster | `nkp-airgap-prod` |
+| `NUTANIX_USER` | Prism Central username | `admin` |
+| `NUTANIX_PASSWORD` | Prism Central password | `'YourPassword'` |
+| `NUTANIX_ENDPOINT` | Prism Central IP/FQDN | `10.0.0.100` |
+| `NUTANIX_PORT` | Prism Central port | `9440` |
+| `CONTROL_PLANE_ENDPOINT_IP` | Kubernetes API VIP | `10.0.0.150` |
+| `LB_IP_RANGE` | Load balancer IP pool | `10.0.0.151-10.0.0.160` |
+| `NUTANIX_PRISM_ELEMENT_CLUSTER_NAME` | PE cluster name | `cluster-01` |
+| `NUTANIX_SUBNET_NAME` | Network subnet | `vm-network` |
+| `NUTANIX_STORAGE_CONTAINER_NAME` | Storage container | `default-container` |
+| `CONTROL_PLANE_REPLICAS` | Control plane nodes | `3` |
+| `WORKER_NODES_REPLICAS` | Worker nodes | `4` |
+
+#### Registry Variables (for push-nkp-airgap-bundle.sh)
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `AIRGAP_REGISTRY_MIRROR_URL` | Internal registry URL | `registry.local/nkp` |
+| `AIRGAP_REGISTRY_MIRROR_USERNAME` | Registry username | `admin` |
+| `AIRGAP_REGISTRY_MIRROR_PASSWORD` | Registry password | `'RegistryPass'` |
+
+#### Registry Variables (for cluster deployment)
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `REGISTRY_MIRROR_URL` | Registry URL for cluster | `registry.local/nkp` |
+| `REGISTRY_MIRROR_USERNAME` | Registry username | `admin` |
+| `REGISTRY_MIRROR_PASSWORD` | Registry password | `'RegistryPass'` |
+
+### Step 4: Push Images to Internal Registry
+
+Ensure your registry variables are configured in `nkp-env`, then run:
+
+```shell
+source nkp-env
+./push-nkp-airgap-bundle.sh
+```
+
+**What this does**:
+1. Reads bundle path from `bundle-path` file
+2. Extracts registry CA certificate
+3. Pushes Konvoy images to registry
+4. Pushes Kommander images to registry
+5. Pushes catalog applications (if present)
+6. Loads bootstrap images into local Docker
+
+**Expected output**:
+```
+Reading bundle path...
+Extracting registry CA certificate...
+Pushing konvoy-image-bundle...
+Pushing kommander-image-bundle...
+Loading bootstrap images...
+Done.
+```
+
+**Verification**:
+```shell
+# Check images in registry (example for Harbor)
+curl -k -u "$AIRGAP_REGISTRY_MIRROR_USERNAME:$AIRGAP_REGISTRY_MIRROR_PASSWORD" \
+  https://$AIRGAP_REGISTRY_MIRROR_URL/v2/_catalog
+
+# Check local Docker images
+docker images | grep -E "(konvoy|kommander|nkp)"
+```
+
+### Step 5: Create Rocky Linux VM Image
+
+Run the image creation script:
+
+```shell
+./nkp-create-image.sh
+```
+
+**What this does**:
+1. Presents menu of available OS versions
+2. Creates VM image in Prism Central
+3. Uploads QCOW2 image for cluster node deployment
+
+**Interactive prompt**:
+```
+Available OS versions:
+1) rocky-9.4
+2) rocky-9.5
+Select OS version [1-2]: 2
+```
+
+**Expected output**:
+```
+Creating image: nkp-rocky-9.5-release-1.30.5-20241125163629.qcow2
+Uploading to Prism Central...
+Image created successfully.
+```
+
+**IMPORTANT**: Copy the image name from the output. You will need it for the next step.
+
+**Verification**:
+- Log into Prism Central
+- Navigate to Images
+- Confirm the new NKP Rocky image appears
+
+### Step 6: Update nkp-env with Image Name
+
+Edit `nkp-env` and set the image name from Step 5:
+
+```shell
+vi nkp-env
+```
+
+Update this line:
+```bash
+NUTANIX_MACHINE_TEMPLATE_IMAGE_NAME=nkp-rocky-9.5-release-1.30.5-20241125163629.qcow2
+```
+
+### Step 7: Deploy Management Cluster
+
+Start a tmux session (recommended for long-running operations):
+
+```shell
+tmux new -s nkp-deploy
+```
+
+Run the cluster creation script:
+
+```shell
+source nkp-env
+./nkp-create-mgmt-cluster.sh
+```
+
+**What this does**:
+1. Validates configuration
+2. Creates bootstrap cluster (local Kind cluster)
+3. Deploys control plane nodes on Nutanix
+4. Deploys worker nodes on Nutanix
+5. Installs Kommander (multi-cluster management)
+6. Pivots to self-managed cluster
+
+**Duration**: 30-60 minutes depending on infrastructure
+
+**Monitoring progress**:
+```shell
+# In another terminal, watch cluster resources
+export KUBECONFIG=$(pwd)/$CLUSTER_NAME.conf
+kubectl get nodes -w
+kubectl get pods -A -w
+```
+
+**Expected completion output**:
+```
+Cluster created successfully.
+Kubeconfig written to: ./nkp-airgap-prod.conf
+```
+
+### Step 8: Access the Cluster
+
+Set your kubeconfig:
+
+```shell
+export KUBECONFIG=$(pwd)/$CLUSTER_NAME.conf
+```
+
+Verify cluster access:
+
+```shell
+kubectl get nodes
+kubectl get pods -A
+```
+
+Access Kommander dashboard:
+
+```shell
+# Get the dashboard URL
+kubectl -n kommander get svc kommander-traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+# Get admin credentials
+kubectl -n kommander get secret dkp-credentials -o jsonpath='{.data.username}' | base64 -d
+kubectl -n kommander get secret dkp-credentials -o jsonpath='{.data.password}' | base64 -d
+```
+
+### Post-Deployment Checklist
+
+- [ ] All nodes show `Ready` status
+- [ ] All system pods are `Running`
+- [ ] Kommander dashboard is accessible
+- [ ] Can create test namespace and deployment
+- [ ] Storage class is available and functional
 
 ## Creating Workload Clusters
 
